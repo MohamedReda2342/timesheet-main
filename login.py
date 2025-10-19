@@ -6,9 +6,6 @@ st.set_page_config(page_title="Login", layout="centered")
 
 st.title("🔐 Login to Timesheet App")
 
-if "logged_in" not in st.session_state:
-    st.session_state["logged_in"] = False
-
 if auth.is_logged_in():
     user = auth.get_current_user()
     st.success(f"Welcome {user['full_name'] or user['username']} ({user['role']})")
@@ -24,6 +21,7 @@ else:
             if not username or not password:
                 st.error("Please enter both username and password.")
             elif auth.login_user(username, password):
+                # Rerun to show the "Welcome" message and logout button
                 st.rerun()
             else:
                 st.error("Invalid username or password.")
