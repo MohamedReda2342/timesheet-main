@@ -1,10 +1,50 @@
-# pages/employee_timesheet_entry.py
+# ./pages/employee_timesheet_entry.py
 import streamlit as st
 import datetime
-from lib import db, auth
+import requests
+from lib import auth, employee_queries as eq
 
 # ================================================================
-# 🔐 Role check and page setup
+# 🛠️ Utility Functions
+# ================================================================
+
+def get_egypt_holidays(year=None):
+    if not year:
+        year = datetime.date.today().year
+    url = f"https://date.nager.at/api/v3/PublicHolidays/{year}/EG"
+    try:
+        res = requests.get(url, timeout=2)
+        if res.status_code == 200:
+            data = res.json()
+            return {datetime.date.fromisoformat(item["date"]) for item in data}
+        return set()
+    except Exception:
+        return set()
+
+def parse_hhmm_to_hours(txt):
+    """
+    Strictly parses input to integer-only hours. 
+    Returns float X.0 for compatibility.
+    """
+    if not txt: return 0.0
+    try:
+        txt = str(txt).strip()
+        # Reject decimals or colons
+        if "." in txt or ":" in txt:
+            return 0.0 
+        
+        val = int(txt)
+        return float(val)
+    except (ValueError, TypeError):
+        return 0.0
+
+def format_hours_to_hhmm(hours):
+    """Formats float hours to integer string."""
+    if not hours or float(hours) <= 0: return ""
+    return str(int(hours))
+
+# ================================================================
+# 🔐 Page Setup
 # ================================================================
 st.set_page_config(page_title="Weekly Timesheet", layout="wide")
 auth.login_required(roles=["user", "admin", "approver"])
@@ -13,164 +53,22 @@ user_info = auth.get_current_user()
 user_id = user_info["user_id"]
 
 # ================================================================
-# 🧩 Database Helpers
+# 🔄 Logic
 # ================================================================
-def fetch_assigned_tasks_for_week(conn, user_id, week_start_date, week_end_date):
-    """
-    Fetch tasks assigned to the user for active projects whose start/end dates overlap
-    the selected week period.
-    """
-    cur = conn.cursor(dictionary=True)
-    sql = """
-        SELECT
-            p.project_id, p.project_name, t.task_id, t.task_name, p.start_date, p.end_date
-        FROM user_tasks ut
-        JOIN tasks t ON ut.task_id = t.task_id
-        JOIN projects p ON t.project_id = p.project_id
-        WHERE
-            ut.user_id = %s
-            AND p.status = 'active'
-            AND (
-                (p.start_date <= %s AND p.end_date >= %s) OR
-                (p.start_date BETWEEN %s AND %s) OR
-                (p.end_date BETWEEN %s AND %s) OR
-                (p.start_date IS NULL AND p.end_date IS NULL)
-            )
-        ORDER BY p.project_name, t.task_name
-    """
-    params = (
-        user_id,
-        week_end_date, week_start_date,  # overlap check
-        week_start_date, week_end_date,  # start within week
-        week_start_date, week_end_date,  # end within week
-    )
-    cur.execute(sql, params)
-    rows = cur.fetchall()
-    cur.close()
-    return rows
 
-
-def fetch_entries_for_week(conn, user_id, week_start_date):
-    """Fetch existing timesheet entries for the selected week."""
-    cur = conn.cursor(dictionary=True)
-    cur.execute("""
-        SELECT te.*, p.project_name, t.task_name
-        FROM timesheet_entries te
-        JOIN projects p ON te.project_id = p.project_id
-        LEFT JOIN tasks t ON te.task_id = t.task_id
-        WHERE te.user_id = %s AND te.week_start_date = %s
-    """, (user_id, week_start_date))
-    rows = cur.fetchall()
-    cur.close()
-    return rows
-
-
-def get_week_status(conn, user_id, week_start_date):
-    """Determine the timesheet status for the current week."""
-    cur = conn.cursor(dictionary=True)
-    cur.execute("""
-        SELECT DISTINCT status
-        FROM timesheet_entries
-        WHERE user_id = %s AND week_start_date = %s
-    """, (user_id, week_start_date))
-    rows = cur.fetchall()
-    cur.close()
-
-    if rows:
-        statuses = {r["status"].lower() for r in rows if r.get("status")}
-        if "approved" in statuses:
-            return "approved"
-        if "submitted" in statuses:
-            return "submitted"
-        if "rejected" in statuses:
-            return "rejected"
-        if "draft" in statuses:
-            return "draft"
-    return "draft"
-
-
-def upsert_weekly_entry(conn, data):
-    """
-    Smart upsert logic:
-    - Update existing row if status is draft/submitted/approved.
-    - Insert new row if existing status is rejected.
-    """
-    cur = conn.cursor(dictionary=True)
-    check_sql = """
-        SELECT entry_id, status
-        FROM timesheet_entries
-        WHERE user_id = %s AND project_id = %s AND task_id = %s AND week_start_date = %s
-        ORDER BY entry_id DESC LIMIT 1
-    """
-    cur.execute(check_sql, (data["user_id"], data["project_id"], data["task_id"], data["week_start_date"]))
-    existing = cur.fetchone()
-
-    if existing:
-        if existing["status"].lower() == "rejected":
-            # Insert new row when re-submitting a rejected entry
-            insert_sql = """
-                INSERT INTO timesheet_entries (
-                    user_id, project_id, task_id, week_start_date,
-                    sunday_hours, monday_hours, tuesday_hours, wednesday_hours,
-                    thursday_hours, friday_hours, saturday_hours, status
-                ) VALUES (
-                    %(user_id)s, %(project_id)s, %(task_id)s, %(week_start_date)s,
-                    %(sunday)s, %(monday)s, %(tuesday)s, %(wednesday)s,
-                    %(thursday)s, %(friday)s, %(saturday)s, %(status)s
-                )
-            """
-            cur.execute(insert_sql, data)
-        else:
-            # Update existing entry
-            update_sql = """
-                UPDATE timesheet_entries
-                SET
-                    sunday_hours = %(sunday)s,
-                    monday_hours = %(monday)s,
-                    tuesday_hours = %(tuesday)s,
-                    wednesday_hours = %(wednesday)s,
-                    thursday_hours = %(thursday)s,
-                    friday_hours = %(friday)s,
-                    saturday_hours = %(saturday)s,
-                    status = %(status)s,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE entry_id = %(entry_id)s
-            """
-            params = dict(data)
-            params["entry_id"] = existing["entry_id"]
-            cur.execute(update_sql, params)
-    else:
-        # Brand new entry
-        insert_sql = """
-            INSERT INTO timesheet_entries (
-                user_id, project_id, task_id, week_start_date,
-                sunday_hours, monday_hours, tuesday_hours, wednesday_hours,
-                thursday_hours, friday_hours, saturday_hours, status
-            ) VALUES (
-                %(user_id)s, %(project_id)s, %(task_id)s, %(week_start_date)s,
-                %(sunday)s, %(monday)s, %(tuesday)s, %(wednesday)s,
-                %(thursday)s, %(friday)s, %(saturday)s, %(status)s
-            )
-        """
-        cur.execute(insert_sql, data)
-    cur.close()
-
-
-# ================================================================
-# 🔄 Data loading and saving logic
-# ================================================================
 def load_week_data(user_id, start_date, end_date):
-    conn = db.get_db_connection()
-    assigned_tasks = fetch_assigned_tasks_for_week(conn, user_id, start_date, end_date)
-    existing_entries = fetch_entries_for_week(conn, user_id, start_date)
-    conn.close()
+    assigned_tasks = eq.fetch_assigned_tasks_for_week(user_id, start_date, end_date)
+    existing_entries = eq.fetch_entries_for_week(user_id, start_date)
 
     all_rows_map = {}
 
-    # Assigned tasks as blank
+    # 1. Build Map from Assignments
     for t in assigned_tasks:
-        key = (t["project_id"], t["task_id"])
+        key = t["AssignmentId"]
         all_rows_map[key] = {
+            "AssignmentId": t["AssignmentId"],
+            "assignment_name": t.get("assignment_name", "Assignment"),
+            "assignment_status": t.get("assignment_status", "active"),
             "project_id": t["project_id"],
             "task_id": t["task_id"],
             "project_name": t["project_name"],
@@ -179,9 +77,11 @@ def load_week_data(user_id, start_date, end_date):
             "status": "draft",
         }
 
-    # Existing entries overwrite
+    # 2. Overlay DB Entries
     for e in existing_entries:
-        key = (e["project_id"], e["task_id"])
+        aid = e.get("AssignmentId")
+        key = aid
+        
         hours = {
             "sunday": format_hours_to_hhmm(e.get("sunday_hours")),
             "monday": format_hours_to_hhmm(e.get("monday_hours")),
@@ -191,168 +91,222 @@ def load_week_data(user_id, start_date, end_date):
             "friday": format_hours_to_hhmm(e.get("friday_hours")),
             "saturday": format_hours_to_hhmm(e.get("saturday_hours")),
         }
-        all_rows_map[key] = {
-            "project_id": e["project_id"],
-            "task_id": e["task_id"],
-            "project_name": e["project_name"],
-            "task_name": e["task_name"],
-            "hours": hours,
-            "status": e["status"],
-        }
 
-    st.session_state["timesheet_rows"] = sorted(all_rows_map.values(), key=lambda x: (x["project_name"], x["task_name"]))
+        if key and key in all_rows_map:
+            all_rows_map[key]["hours"] = hours
+            all_rows_map[key]["status"] = e["status"]
+        elif not key:
+            # Legacy entry fallback
+            found = False
+            for k, val in all_rows_map.items():
+                if val["project_id"] == e["project_id"] and val["task_id"] == e["task_id"]:
+                    val["hours"] = hours
+                    val["status"] = e["status"]
+                    found = True
+                    break
+            if not found:
+                ghost_key = f"ghost_{e['entry_id']}"
+                all_rows_map[ghost_key] = {
+                    "AssignmentId": None,
+                    "assignment_name": "(Legacy/Removed)",
+                    "assignment_status": "inactive",
+                    "project_id": e["project_id"],
+                    "task_id": e["task_id"],
+                    "project_name": e["project_name"],
+                    "task_name": e["task_name"],
+                    "hours": hours,
+                    "status": e["status"],
+                }
 
+    st.session_state["timesheet_rows"] = sorted(all_rows_map.values(), key=lambda x: (x["project_name"], x["assignment_name"]))
 
-def save_timesheet(user_id, start_date, status):
-    conn = db.get_db_connection()
+def handle_save(status_type):
     day_keys = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+    rows_to_save = st.session_state.get("timesheet_rows", [])
+    
+    if not rows_to_save:
+        st.warning("No tasks assigned.")
+        return
+
+    weekly_total = 0.0
+    for row in rows_to_save:
+        for day in day_keys:
+             # Validation: Check if input is valid integer string
+             raw_val = str(row.get("hours", {}).get(day, "")).strip()
+             if raw_val:
+                 if not raw_val.isdigit():
+                     st.error(f"❌ Invalid input '{raw_val}' for {row['assignment_name']}. Only whole numbers allowed.")
+                     return
+             
+             val = parse_hhmm_to_hours(raw_val)
+             weekly_total += val
+    
+    if weekly_total > 40.0:
+        st.error(f"❌ Limit Exceeded: You have logged **{int(weekly_total)} hours**. Maximum allowed is 40 hours/week.")
+        return
 
     try:
-        conn.start_transaction()
-        for row in st.session_state.get("timesheet_rows", []):
+        for row in rows_to_save:
             data = {
                 "user_id": user_id,
+                "AssignmentId": row.get("AssignmentId"),
                 "project_id": row["project_id"],
-                "task_id": row.get("task_id"),
-                "week_start_date": start_date,
-                "status": status,
+                "task_id": row["task_id"],
+                "week_start_date": st.session_state["ts_week_start"],
+                "status": status_type,
             }
             for day in day_keys:
-                data[day] = parse_hhmm_to_hours(row.get("hours", {}).get(day, "0:00"))
-            upsert_weekly_entry(conn, data)
-        conn.commit()
-        st.success(f"✅ Timesheet saved as **{status.upper()}**.")
+                data[day] = parse_hhmm_to_hours(row.get("hours", {}).get(day, "0"))
+            
+            eq.upsert_weekly_entry(data)
+            
+        st.success(f"✅ Timesheet {status_type}.")
+        st.rerun()
     except Exception as e:
-        conn.rollback()
-        st.error(f"❌ Failed to save timesheet: {e}")
-    finally:
-        conn.close()
-
-    load_week_data(user_id, start_date, start_date + datetime.timedelta(days=6))
-    st.rerun()
-
-
-# ================================================================
-# 🕒 Time utilities
-# ================================================================
-def parse_hhmm_to_hours(txt):
-    if not txt:
-        return 0.0
-    try:
-        txt = str(txt).strip()
-        if ":" in txt:
-            h, m = map(float, txt.split(":"))
-            return h + m / 60.0
-        return float(txt)
-    except (ValueError, TypeError):
-        return 0.0
-
-
-def format_hours_to_hhmm(hours):
-    if not hours or float(hours) <= 0:
-        return ""
-    total_minutes = int(round(float(hours) * 60))
-    h, m = divmod(total_minutes, 60)
-    return f"{h}:{m:02d}"
-
+        st.error(f"❌ Error saving: {e}")
 
 # ================================================================
 # 🎨 Main UI
 # ================================================================
-st.title("📅 Weekly Timesheet")
-st.write(f"Employee: **{user_info['full_name']}**")
 
 if "ts_week_start" not in st.session_state:
     today = datetime.date.today()
-    st.session_state["ts_week_start"] = today - datetime.timedelta(days=(today.weekday() + 1) % 7)
+    st.session_state["ts_week_start"] = today - datetime.timedelta(days=today.weekday())
 
 start_date = st.session_state["ts_week_start"]
 end_date = start_date + datetime.timedelta(days=6)
 
-# Week navigation
-c1, c2, c3 = st.columns([1.5, 6, 1.5])
-if c1.button("◀ Previous Week"):
+st.title("📅 Weekly Timesheet")
+st.write(f"User: **{user_info['full_name']}**")
+
+c1, c2, c3 = st.columns([1, 4, 1])
+if c1.button("◀ Prev"):
     st.session_state["ts_week_start"] -= datetime.timedelta(days=7)
     st.rerun()
-c2.markdown(f"<h3 style='text-align:center;'>{start_date.strftime('%d %b')} → {end_date.strftime('%d %b %Y')}</h3>", unsafe_allow_html=True)
-if c3.button("Next Week ▶"):
+c2.markdown(f"<h3 style='text-align: center'>{start_date.strftime('%d %b')} - {end_date.strftime('%d %b %Y')}</h3>", unsafe_allow_html=True)
+if c3.button("Next ▶"):
     st.session_state["ts_week_start"] += datetime.timedelta(days=7)
     st.rerun()
 
-# Week status
-conn = db.get_db_connection()
-week_status = get_week_status(conn, user_id, start_date)
-conn.close()
+try:
+    week_status = eq.get_week_status(user_id, start_date)
+except Exception as e:
+    st.error(f"DB Error: {e}")
+    week_status = "draft"
 
-status_colors = {"draft": "gray", "submitted": "blue", "approved": "green", "rejected": "red"}
-st.markdown(f"<h4 style='color:{status_colors.get(week_status, 'black')};'>🧾 Week Status: {week_status.upper()}</h4>", unsafe_allow_html=True)
+status_colors = {"draft": "grey", "submitted": "blue", "approved": "green", "rejected": "red"}
+st.markdown(f"**Status:** <span style='color:{status_colors.get(week_status, 'black')}'>**{week_status.upper()}**</span>", unsafe_allow_html=True)
 
-# Load data
+if week_status == "rejected":
+    reason = eq.get_latest_rejection_reason(user_id, start_date)
+    st.error(f"🚫 **Rejection Reason:** {reason}")
+
 load_week_data(user_id, start_date, end_date)
-rows = st.session_state.get("timesheet_rows", [])
-day_keys = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
-day_names = [(start_date + datetime.timedelta(days=i)).strftime("%a").upper() for i in range(7)]
+rows = st.session_state["timesheet_rows"]
+holidays = get_egypt_holidays(start_date.year)
 
-# Header
-header = st.columns([3, 4] + [1] * 7 + [1.5])
-header[0].markdown("**PROJECT**")
-header[1].markdown("**TASK**")
-for i, n in enumerate(day_names):
-    header[2 + i].markdown(f"**{n}**")
-header[-1].markdown("**ROW TOTAL**")
+# Fetch Vacations
+vacations_raw = eq.fetch_approved_vacations_for_week(user_id, start_date, end_date)
+vacation_dates = set()
+for v in vacations_raw:
+    v_start = v.get('From')
+    v_end = v.get('To')
+    
+    # Robust conversion to date objects
+    if isinstance(v_start, datetime.datetime): v_start = v_start.date()
+    if isinstance(v_end, datetime.datetime): v_end = v_end.date()
+    
+    if v_start and v_end:
+        delta = v_end - v_start
+        for i in range(delta.days + 1):
+            vacation_dates.add(v_start + datetime.timedelta(days=i))
 
-# Rows
-if not rows:
-    st.info("No assigned tasks for this week.")
-else:
-    for i, row in enumerate(rows):
-        cols = st.columns([3, 4] + [1] * 7 + [1.5])
-        cols[0].markdown(row.get("project_name", ""))
-        cols[1].markdown(row.get("task_name", ""))
-        row_total = 0.0
-        for j, day in enumerate(day_keys):
-            val = row.get("hours", {}).get(day, "")
-            if week_status in ["approved", "submitted"]:
-                cols[2 + j].markdown(val if val else "")
-            else:
-                input_val = cols[2 + j].text_input(
-                    f"cell_{i}_{j}", value=val, placeholder="0:00", label_visibility="collapsed"
-                )
-                row.setdefault("hours", {})[day] = input_val
-                row_total += parse_hhmm_to_hours(input_val)
-        cols[-1].markdown(f"**{format_hours_to_hhmm(row_total)}**" if row_total > 0 else "")
+# Grid Header
+day_names = [(start_date + datetime.timedelta(days=i)).strftime("%a %d") for i in range(7)]
+cols_spec = [3, 2, 2] + [1]*7 + [1] 
+header = st.columns(cols_spec)
+header[0].write("**Assignment**")
+header[1].write("**Task**")
+header[2].write("**Project**")
+for i, d in enumerate(day_names):
+    header[3+i].write(f"**{d}**")
+header[-1].write("**Total**")
 
-    # Totals
-    st.markdown("---")
-    foot = st.columns([3, 4] + [1] * 7 + [1.5])
-    foot[0].markdown("#### TOTALS")
-    grand_total = 0.0
-    for j, day in enumerate(day_keys):
-        day_total = sum(parse_hhmm_to_hours(r.get("hours", {}).get(day, "")) for r in rows)
-        grand_total += day_total
-        foot[2 + j].markdown(f"**{format_hours_to_hhmm(day_total)}**" if day_total > 0 else "")
-    foot[-1].markdown(f"### {format_hours_to_hhmm(grand_total)}")
-
-# ================================================================
-# 💾 Buttons
-# ================================================================
 st.markdown("---")
-b1, b2, _ = st.columns([2, 2, 8])
 
+# Grid Rows
+day_keys = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+grand_total = 0.0
+day_totals = {d: 0.0 for d in day_keys}
+
+for idx, row in enumerate(rows):
+    c = st.columns(cols_spec)
+    
+    assign_status = row.get('assignment_status', 'active').lower()
+    assign_name = row.get('assignment_name', '-')
+    
+    status_icon = ""
+    if assign_status == "hold": status_icon = "⏸️"
+    elif assign_status == "completed": status_icon = "✅"
+    
+    c[0].write(f"{assign_name} {status_icon}")
+    c[1].caption(row['task_name'])
+    c[2].caption(row['project_name'])
+    
+    row_sum = 0.0
+    row_disabled = (assign_status != 'active')
+    
+    for i, day in enumerate(day_keys):
+        current_date = start_date + datetime.timedelta(days=i)
+        val = row["hours"].get(day, "")
+        
+        disabled = (week_status in ["submitted", "approved"]) or row_disabled
+        is_holiday = (current_date in holidays)
+        is_vacation = (current_date in vacation_dates)
+        
+        if is_vacation:
+            c[3+i].write("✈️")
+            if not disabled: 
+                row["hours"][day] = "0" # Logic reset
+        elif is_holiday:
+            c[3+i].write("🏖️")
+            if not disabled: 
+                row["hours"][day] = "0"
+        else:
+            new_val = c[3+i].text_input(
+                f"h_{idx}_{day}", 
+                value=val, 
+                label_visibility="collapsed",
+                disabled=disabled,
+                placeholder="-" if row_disabled else "0"
+            )
+            if not disabled:
+                row["hours"][day] = new_val
+            
+            hrs = parse_hhmm_to_hours(new_val)
+            row_sum += hrs
+            day_totals[day] += hrs
+            
+    c[-1].write(f"**{int(row_sum)}**")
+    grand_total += row_sum
+
+# Footer
+st.markdown("---")
+f = st.columns(cols_spec)
+f[0].write("**TOTALS**")
+for i, day in enumerate(day_keys):
+    f[3+i].write(f"**{int(day_totals[day])}**")
+f[-1].write(f"**{int(grand_total)}**")
+
+# Actions
+st.write("")
+ac1, ac2, _ = st.columns([1, 1, 6])
 if week_status in ["draft", "rejected"]:
-    if b1.button("💾 Save Draft", use_container_width=True):
-        if not rows:
-            st.warning("No rows to save.")
-        else:
-            save_timesheet(user_id, start_date, "draft")
-
-    if b2.button("📤 Submit", type="primary", use_container_width=True):
-        if not rows:
-            st.warning("No rows to submit.")
-        else:
-            save_timesheet(user_id, start_date, "submitted")
-
+    if ac1.button("💾 Save Draft", use_container_width=True):
+        handle_save("draft")
+    if ac2.button("🚀 Submit Week", type="primary", use_container_width=True):
+        handle_save("submitted")
 elif week_status == "submitted":
-    st.info("⏳ Timesheet submitted. Awaiting approval — editing disabled.")
+    st.info("Timesheet submitted.")
 elif week_status == "approved":
-    st.success("✅ Timesheet approved and locked.")
+    st.success("Timesheet approved.")

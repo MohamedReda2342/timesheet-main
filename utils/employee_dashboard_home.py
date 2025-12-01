@@ -1,9 +1,10 @@
+# ./utils/employee_dashboard_home.py
+
 import streamlit as st
-import mysql.connector
 import pandas as pd
 import datetime
 import altair as alt
-from lib import db
+from lib import employee_queries as eq
 
 # --- Role Enforcement ---
 def require_role(allowed_roles):
@@ -19,41 +20,21 @@ def employee_dashboard_home():
     require_role(['user', 'admin'])
     user_id = st.session_state.get("user_id")
 
-    conn = db.get_db()
-    cursor = conn.cursor(dictionary=True)
-
     today = datetime.date.today()
     week_start = today - datetime.timedelta(days=today.weekday())
     month_start = today.replace(day=1)
     last_7_days = today - datetime.timedelta(days=6)
 
     # --- KPI 1: Total hours logged this week ---
-    cursor.execute("""
-        SELECT IFNULL(SUM(hours), 0) AS total_hours
-        FROM timesheet_entries
-        WHERE user_id = %s AND entry_date BETWEEN %s AND %s
-    """, (user_id, week_start, today))
-    total_hours = cursor.fetchone()['total_hours']
+    total_hours = eq.get_weekly_hours(user_id, week_start, today)
 
     # --- KPI 2: Approved vs Rejected entries ---
-    cursor.execute("""
-        SELECT 
-            SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END) AS approved,
-            SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END) AS rejected
-        FROM timesheet_entries
-        WHERE user_id = %s
-    """, (user_id,))
-    status_data = cursor.fetchone()
+    status_data = eq.get_entry_status_counts(user_id)
     approved_count = status_data['approved'] or 0
     rejected_count = status_data['rejected'] or 0
 
     # --- KPI 3: Active projects worked on this month ---
-    cursor.execute("""
-        SELECT COUNT(DISTINCT project_id) AS active_projects
-        FROM timesheet_entries
-        WHERE user_id = %s AND entry_date >= %s
-    """, (user_id, month_start))
-    active_projects = cursor.fetchone()['active_projects']
+    active_projects = eq.get_active_projects_count(user_id, month_start)
 
     # --- Display KPIs ---
     col1, col2, col3 = st.columns(3)
@@ -63,14 +44,8 @@ def employee_dashboard_home():
     st.metric("📁 Active Projects (This Month)", active_projects)
 
     # --- Bar Chart: Total hours per project (This Month) ---
-    cursor.execute("""
-        SELECT p.project_name, SUM(t.hours) AS total_hours
-        FROM timesheet_entries t
-        JOIN projects p ON t.project_id = p.project_id
-        WHERE t.user_id = %s AND t.entry_date BETWEEN %s AND %s
-        GROUP BY p.project_name
-    """, (user_id, month_start, today))
-    project_hours = pd.DataFrame(cursor.fetchall())
+    project_hours_data = eq.get_project_hours_distribution(user_id, month_start, today)
+    project_hours = pd.DataFrame(project_hours_data)
 
     if not project_hours.empty:
         bar_chart = alt.Chart(project_hours).mark_bar().encode(
@@ -83,18 +58,15 @@ def employee_dashboard_home():
         st.info("No project data available for this month.")
 
     # --- Line Chart: Hours per day (Last 7 Days) ---
-    cursor.execute("""
-        SELECT entry_date, SUM(hours) AS total_hours
-        FROM timesheet_entries
-        WHERE user_id = %s AND entry_date BETWEEN %s AND %s
-        GROUP BY entry_date
-        ORDER BY entry_date
-    """, (user_id, last_7_days, today))
-    daily_hours = pd.DataFrame(cursor.fetchall())
-
-
-    cursor.close()
-    conn.close()
+    daily_hours_data = eq.get_daily_hours_last_7_days(user_id, last_7_days, today)
+    daily_hours = pd.DataFrame(daily_hours_data)
+    
+    if not daily_hours.empty:
+         line_chart = alt.Chart(daily_hours).mark_line(point=True).encode(
+            x=alt.X('entry_date', title='Date'),
+            y=alt.Y('total_hours', title='Hours Logged')
+        ).properties(title='Daily Hours (Last 7 Days)')
+         st.altair_chart(line_chart, use_container_width=True)
 
 # --- Run Page ---
 if __name__ == "__main__":
