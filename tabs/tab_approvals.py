@@ -2,7 +2,7 @@
 import streamlit as st
 import pandas as pd
 from utils import manager_queries as mq
-from utils.state_helpers import clear_other_dialogs
+from utils.state_helpers import clear_other_dialogs, reset_dialog_state
 
 @st.dialog("Reject Timesheet")
 def reject_timesheet_dialog(entry, approver_id):
@@ -15,19 +15,135 @@ def reject_timesheet_dialog(entry, approver_id):
             else:
                 mq.update_entry_status(entry['entry_id'], approver_id, 'rejected', comment)
                 st.success("Rejected.")
+                if "reject_entry_info" in st.session_state:
+                    del st.session_state["reject_entry_info"]
                 st.rerun()
 
-def render(user):
+@st.dialog("✏️ Edit Entry (Admin)")
+def edit_entry_dialog(entry_summary, admin_user_id):
+    # Fetch full details from DB (hours, IDs)
+    entry_id = entry_summary['entry_id']
+    full_entry = mq.get_timesheet_entry_details(entry_id)
+    
+    if not full_entry:
+        st.error("Entry not found.")
+        return
+
+    st.caption(f"Employee: {entry_summary['employee_name']} | Week: {entry_summary['week_start_date']}")
+
+    with st.form("edit_entry_full_form"):
+        # 1. Project & Task Selection
+        col_pt1, col_pt2 = st.columns(2)
+        
+        # Project - Admins see ALL active projects
+        all_projects = mq.fetch_all_active_projects()
+        proj_opts = {p['project_id']: p['project_name'] for p in all_projects}
+        curr_proj = full_entry.get('project_id')
+        idx_proj = list(proj_opts.keys()).index(curr_proj) if curr_proj in proj_opts else 0
+        sel_proj = col_pt1.selectbox("Project", options=proj_opts.keys(), format_func=lambda x: proj_opts[x], index=idx_proj)
+        
+        # Task Type & Task
+        task_types = mq.fetch_task_types()
+        type_opts = {t['TaskTypeId']: t['TaskTypeName'] for t in task_types}
+        
+        curr_type = full_entry.get('TaskTypeId')
+        if curr_type and curr_type in type_opts:
+            idx_type = list(type_opts.keys()).index(curr_type)
+        else:
+            idx_type = 0
+            
+        sel_type = col_pt2.selectbox("Task Type", options=type_opts.keys(), format_func=lambda x: type_opts[x], index=idx_type)
+        
+        tasks = mq.fetch_tasks_by_type(sel_type)
+        task_opts = {t['task_id']: t['task_name'] for t in tasks}
+        
+        curr_task = full_entry.get('task_id')
+        idx_task = list(task_opts.keys()).index(curr_task) if curr_task in task_opts else 0
+        
+        sel_task = st.selectbox("Task", options=task_opts.keys(), format_func=lambda x: task_opts[x], index=idx_task)
+
+        st.markdown("---")
+        st.write("**Hours**")
+        
+        # 2. Hours Input
+        cols_h = st.columns(7)
+        days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday']
+        new_hours = {}
+        
+        for i, day in enumerate(days):
+            val = int(full_entry.get(f"{day}_hours") or 0)
+            safe_max = max(24, val) 
+            
+            new_hours[day] = cols_h[i].number_input(
+                day[:3].capitalize(), 
+                min_value=0, 
+                max_value=safe_max,
+                step=1,       
+                format="%d",  
+                value=val
+            )
+
+        st.markdown("---")
+        
+        # 3. Status & Notes
+        c_stat, c_note = st.columns([1, 2])
+        status_opts = ["draft", "submitted", "approved", "rejected"]
+        curr_status = full_entry.get("status", "submitted").lower()
+        idx_stat = status_opts.index(curr_status) if curr_status in status_opts else 1
+        
+        sel_status = c_stat.selectbox("Status", status_opts, index=idx_stat)
+        notes = c_note.text_input("Notes", value=full_entry.get("notes") or "")
+
+        if st.form_submit_button("💾 Save Changes"):
+            total_hours = sum(new_hours.values())
+            
+            if total_hours > 40:
+                st.error(f"❌ Limit Exceeded: Total hours ({total_hours}) cannot exceed 40 per week.")
+            elif not sel_task:
+                st.error("Task is required.")
+            else:
+                data = {
+                    "entry_id": entry_id,
+                    "project_id": sel_proj,
+                    "task_id": sel_task,
+                    "status": sel_status,
+                    "notes": notes,
+                    **new_hours
+                }
+                mq.update_timesheet_entry_full(data)
+                st.success("Entry updated successfully!")
+                
+                if "edit_entry_info" in st.session_state:
+                    del st.session_state["edit_entry_info"]
+                st.rerun()
+
+def render(user, is_admin=False):
     st.subheader("Pending & Submitted Timesheets")
-    entries = mq.fetch_submitted_weekly_entries(user['user_id'])
+    # Updated: Passed is_admin to fetch ALL entries if admin
+    entries = mq.fetch_submitted_weekly_entries(user['user_id'], is_admin)
     
     if not entries:
         st.info("No pending timesheets.")
     else:
         df = pd.DataFrame(entries)
         col1, col2 = st.columns(2)
-        emp_filter = col1.selectbox("Employee", ["All"] + sorted(df["employee_name"].unique().tolist()))
-        status_filter = col2.selectbox("Status", ["All", "draft", "submitted", "approved", "rejected"])
+        
+        unique_emps = sorted(df["employee_name"].unique().tolist())
+        
+        # FIX: Added on_change=reset_dialog_state to ensure modals don't pop up when filtering
+        emp_filter = col1.selectbox(
+            "Employee", 
+            ["All"] + unique_emps, 
+            key="approvals_emp_filter", 
+            on_change=reset_dialog_state
+        )
+        
+        status_filter = col2.selectbox(
+            "Status", 
+            ["All", "draft", "submitted", "approved", "rejected"], 
+            key="approvals_status_filter",
+            on_change=reset_dialog_state
+        )
         
         filtered = df.copy()
         if emp_filter != "All": filtered = filtered[filtered["employee_name"] == emp_filter]
@@ -36,12 +152,21 @@ def render(user):
         if filtered.empty:
             st.warning("No matches.")
         else:
-            cols = st.columns([3, 3, 2, 2, 2, 2])
-            headers = ["Employee", "Project / Task", "Week", "Hrs", "Approve", "Reject"]
+            if is_admin:
+                cols = st.columns([3, 3, 2, 2, 1.5, 1.5, 1])
+                headers = ["Employee", "Project / Task", "Week", "Hrs", "Approve", "Reject", "Edit"]
+            else:
+                cols = st.columns([3, 3, 2, 2, 2, 2])
+                headers = ["Employee", "Project / Task", "Week", "Hrs", "Approve", "Reject"]
+                
             for c, h in zip(cols, headers): c.write(f"**{h}**")
 
             for row in filtered.to_dict("records"):
-                c = st.columns([3, 3, 2, 2, 2, 2])
+                if is_admin:
+                    c = st.columns([3, 3, 2, 2, 1.5, 1.5, 1])
+                else:
+                    c = st.columns([3, 3, 2, 2, 2, 2])
+                    
                 c[0].write(row['employee_name'])
                 c[1].write(f"{row['project_name']} / {row['task_name'] or '--'}")
                 c[2].write(str(row['week_start_date']))
@@ -58,8 +183,10 @@ def render(user):
                     if c[5].button("❌", key=f"rej_{row['entry_id']}"):
                         clear_other_dialogs("reject_entry_info")
                         st.session_state.reject_entry_info = row
-
-    # Dialog Invocation
-    if st.session_state.get("reject_entry_info"):
-        reject_timesheet_dialog(st.session_state.get("reject_entry_info"), user['user_id'])
-        del st.session_state["reject_entry_info"]
+                        st.rerun()
+                
+                if is_admin:
+                    if c[6].button("✏️", key=f"adm_edit_{row['entry_id']}"):
+                        clear_other_dialogs("edit_entry_info")
+                        st.session_state.edit_entry_info = row
+                        st.rerun()

@@ -8,19 +8,18 @@ def task_form_dialog(task_id, user_id):
     task = mq.get_task(task_id) if task_id else {}
     is_edit = bool(task_id)
     
-    st.subheader(f"{'Edit' if is_edit else 'Add'} Task Definition")
+    st.subheader(f"{'Edit' if is_edit else 'Add'} Global Task")
     
     with st.form("task_form"):
-        projects = mq.fetch_approver_projects(user_id)
-        task_types = mq.fetch_task_types()
-        
-        proj_opts = {p['project_id']: p['project_name'] for p in projects}
-        curr_proj = task.get('project_id')
-        idx_proj = list(proj_opts.keys()).index(curr_proj) if curr_proj in proj_opts else 0
-        sel_proj = st.selectbox("Project", options=proj_opts.keys(), format_func=lambda x: proj_opts[x], index=idx_proj)
+        # Note: Projects are no longer selected here because Tasks are Global.
         
         name = st.text_input("Task Name", value=task.get('task_name', ''))
         
+        task_types = mq.fetch_task_types()
+        if not task_types:
+            st.error("No Task Types found. Please add them in the 'Task Types' tab.")
+            st.stop()
+
         type_opts = {t['TaskTypeId']: t['TaskTypeName'] for t in task_types}
         curr_type = task.get('TaskTypeId')
         idx_type = list(type_opts.keys()).index(curr_type) if curr_type in type_opts else 0
@@ -32,7 +31,6 @@ def task_form_dialog(task_id, user_id):
             else:
                 data = {
                     "task_id": task_id,
-                    "project_id": sel_proj,
                     "task_name": name,
                     "TaskTypeId": sel_type,
                     "created_by": user_id
@@ -40,7 +38,7 @@ def task_form_dialog(task_id, user_id):
                 mq.upsert_task(data)
                 st.success("Task saved successfully!")
                 
-                # CLOSE DIALOG MANUALLY
+                # Close dialog
                 if "show_task_dialog" in st.session_state:
                     del st.session_state["show_task_dialog"]
                 if "edit_task_id" in st.session_state:
@@ -58,7 +56,6 @@ def confirm_delete_dialog(task):
             mq.delete_task(task['task_id'])
             st.success("Task deleted.")
             
-            # CLOSE DIALOG MANUALLY
             if "delete_def_info" in st.session_state:
                 del st.session_state["delete_def_info"]
                 
@@ -72,7 +69,7 @@ def confirm_delete_dialog(task):
 
 def render(user):
     c1, c2 = st.columns([3, 1])
-    c1.subheader("Task Definitions")
+    c1.subheader("Global Task Definitions")
     
     if c2.button("➕ Create New Task", type="primary", use_container_width=True):
         clear_other_dialogs("show_task_dialog")
@@ -85,24 +82,23 @@ def render(user):
     if not tasks:
         st.info("No tasks defined.")
     else:
-        cols = st.columns([2, 2, 2, 1, 0.5, 0.5])
-        headers = ["Project", "Task Name", "Type", "Created", "Edit", "Del"]
+        # Columns: Name, Type, Edit, Del
+        cols = st.columns([5, 3, 0.5, 0.5])
+        headers = ["Task Name", "Type", "Edit", "Del"]
         for c, h in zip(cols, headers): c.write(f"**{h}**")
 
         for t in tasks:
-            c = st.columns([2, 2, 2, 1, 0.5, 0.5])
-            c[0].write(t['project_name'])
-            c[1].write(t['task_name'])
-            c[2].write(t['TaskTypeName'] or "-")
-            c[3].write("---") 
+            c = st.columns([5, 3, 0.5, 0.5])
+            c[0].write(t['task_name'])
+            c[1].write(t['TaskTypeName'] or "-")
 
-            if c[4].button("✏️", key=f"edt_{t['task_id']}"):
+            if c[2].button("✏️", key=f"edt_{t['task_id']}"):
                 clear_other_dialogs("show_task_dialog")
                 st.session_state.edit_task_id = t['task_id']
                 st.session_state.show_task_dialog = True
                 st.rerun()
                 
-            if c[5].button("🗑️", key=f"del_def_{t['task_id']}"):
+            if c[3].button("🗑️", key=f"del_def_{t['task_id']}"):
                 clear_other_dialogs("delete_def_info")
                 st.session_state.delete_def_info = t
                 st.rerun()

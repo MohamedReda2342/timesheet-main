@@ -1,8 +1,12 @@
 # pages/login.py
 import streamlit as st
 from lib import auth
+from utils.state_helpers import track_page_visit
 
 st.set_page_config(page_title="Login", layout="centered")
+
+# 1. Track Page Visit
+track_page_visit("login")
 
 st.title("🔐 Login to Timesheet App")
 
@@ -21,7 +25,6 @@ else:
             if not username or not password:
                 st.error("Please enter both username and password.")
             elif auth.login_user(username, password):
-                # Rerun to show the "Welcome" message and logout button
                 st.rerun()
             else:
                 st.error("Invalid username or password.")

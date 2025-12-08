@@ -1,6 +1,5 @@
 # ./tabs/tab_assignments.py
 import streamlit as st
-import pandas as pd
 from datetime import date
 from utils import manager_queries as mq
 from utils.state_helpers import clear_other_dialogs
@@ -13,8 +12,9 @@ from utils.state_helpers import clear_other_dialogs
 def assignment_wizard_dialog(user_id, is_admin):
     st.subheader("Add New Assignment")
     
-    # Step 1: Project & Type
-    projects = mq.fetch_approver_projects(user_id)
+    # Step 1: Project (Context for the assignment)
+    # Passed is_admin to fetch ALL projects if admin
+    projects = mq.fetch_approver_projects(user_id, is_admin)
     if not projects:
         st.error("No projects found.")
         return
@@ -22,25 +22,24 @@ def assignment_wizard_dialog(user_id, is_admin):
     proj_opts = {p['project_id']: p['project_name'] for p in projects}
     sel_proj = st.selectbox("1. Select Project", options=proj_opts.keys(), format_func=lambda x: proj_opts[x])
 
+    # Step 2: Task Type
     task_types = mq.fetch_task_types()
     type_opts = {t['TaskTypeId']: t['TaskTypeName'] for t in task_types}
     sel_type = st.selectbox("2. Select Task Type", options=type_opts.keys(), format_func=lambda x: type_opts[x])
     
-    # Step 2: Task
-    tasks = mq.fetch_tasks_by_project_and_type(sel_proj, sel_type)
+    # Step 3: Global Task (Filtered by Type ONLY)
+    tasks = mq.fetch_tasks_by_type(sel_type)
     
     if not tasks:
-        st.warning("No tasks found for this Project & Type.")
+        st.warning("No tasks found for this Task Type.")
         if is_admin:
-            st.info("Please go to the 'Task Definitions' tab to create this task first.")
-        else:
-            st.info("Ask an Admin to create the Task Definition first.")
+            st.info("Please create Global Tasks in the **Task Definitions** tab.")
         return
 
     task_opts = {t['task_id']: t['task_name'] for t in tasks}
     sel_task = st.selectbox("3. Select Task", options=task_opts.keys(), format_func=lambda x: task_opts[x])
     
-    # Step 3: Assignment Details
+    # Step 4: Assignment Details
     st.markdown("---")
     st.write("**4. Assignment Details**")
     
@@ -61,6 +60,7 @@ def assignment_wizard_dialog(user_id, is_admin):
     if st.button("✅ Create Assignment", type="primary"):
         data = {
             "AssignmentId": None,
+            "project_id": sel_proj,
             "task_id": sel_task,
             "EmpId": sel_emp,
             "assignment_name": assign_name,
@@ -79,12 +79,48 @@ def assignment_wizard_dialog(user_id, is_admin):
         st.rerun()
 
 @st.dialog("✏️ Edit Assignment")
-def edit_assignment_dialog(assign):
+def edit_assignment_dialog(assign, user_id, is_admin):
     st.subheader(f"Edit Assignment")
-    st.caption(f"Employee: {assign['EmpName']} | Task: {assign['task_name']}")
     
     with st.form("edit_assign_form"):
-        # Allow changing employee
+        # 1. Project Selection
+        # Passed is_admin to fetch ALL projects if admin
+        projects = mq.fetch_approver_projects(user_id, is_admin)
+        if not projects:
+            st.error("No projects found.")
+            st.stop()
+            
+        proj_opts = {p['project_id']: p['project_name'] for p in projects}
+        
+        curr_proj = assign.get('project_id')
+        idx_proj = list(proj_opts.keys()).index(curr_proj) if curr_proj in proj_opts else 0
+        sel_proj = st.selectbox("1. Project", options=proj_opts.keys(), format_func=lambda x: proj_opts[x], index=idx_proj)
+
+        # 2. Task Type Selection
+        task_types = mq.fetch_task_types()
+        type_opts = {t['TaskTypeId']: t['TaskTypeName'] for t in task_types}
+        
+        curr_type = assign.get('TaskTypeId')
+        idx_type = list(type_opts.keys()).index(curr_type) if curr_type in type_opts else 0
+        sel_type = st.selectbox("2. Task Type", options=type_opts.keys(), format_func=lambda x: type_opts[x], index=idx_type)
+        
+        # 3. Task Selection (Global filtered by Type ONLY)
+        tasks = mq.fetch_tasks_by_type(sel_type)
+        
+        if not tasks:
+            st.warning("No tasks found for this Type.")
+            st.form_submit_button("Cannot Save (No Task)")
+            return 
+            
+        task_opts = {t['task_id']: t['task_name'] for t in tasks}
+        
+        curr_task = assign.get('task_id')
+        idx_task = list(task_opts.keys()).index(curr_task) if curr_task in task_opts else 0
+        sel_task = st.selectbox("3. Task", options=task_opts.keys(), format_func=lambda x: task_opts[x], index=idx_task)
+
+        st.markdown("---")
+        
+        # 4. Details
         all_emps = mq.get_all_employees()
         emp_opts = {e['EmpId']: f"{e['EmpName']} ({e['SAP_ID']})" for e in all_emps}
         
@@ -107,7 +143,8 @@ def edit_assignment_dialog(assign):
         if st.form_submit_button("💾 Save Changes"):
             data = {
                 "AssignmentId": assign['AssignmentId'],
-                "task_id": assign['task_id'],
+                "project_id": sel_proj,
+                "task_id": sel_task, 
                 "EmpId": sel_emp,
                 "assignment_name": name,
                 "planned_hours": hrs,
@@ -127,13 +164,12 @@ def edit_assignment_dialog(assign):
 @st.dialog("Delete Assignment")
 def confirm_delete_dialog(assign):
     st.warning(f"Delete assignment for **{assign['EmpName']}**?")
-    st.caption(f"Task: {assign['task_name']}")
+    st.caption(f"Task: {assign['task_name']} | Project: {assign['project_name']}")
     col1, col2 = st.columns(2)
     if col1.button("Yes, Delete", type="primary"):
         mq.delete_assignment(assign['AssignmentId'])
         st.success("Deleted.")
         
-        # CLOSE DIALOG
         if "del_assign" in st.session_state:
             del st.session_state["del_assign"]
         st.rerun()
@@ -177,18 +213,20 @@ def render(user, is_admin):
         st.session_state.show_assignment_wizard = True
         st.rerun()
 
-    # FETCH ASSIGNMENTS (Not Tasks)
-    assignments = mq.get_all_assignments_for_manager(user['user_id'])
+    # Passed is_admin to fetch ALL assignments if admin
+    assignments = mq.get_all_assignments_for_manager(user['user_id'], is_admin)
     
     if not assignments:
         st.info("No active assignments found.")
-        st.markdown("""
-        **To get started:**
-        1. Click **➕ New Assignment** to assign an employee to a task.
-        2. If you don't see any Tasks in the dropdown, ask an Admin to create them in the **Task Definitions** tab.
-        """)
+        if is_admin:
+            st.markdown("""
+            **To get started:**
+            1. Define Global Tasks in the **Task Definitions** tab.
+            2. Click **➕ New Assignment** to link an Employee to a Task on a Project.
+            """)
+        else:
+             st.markdown("No assignments found.")
     else:  
-        # Display Assignment Rows
         cols = st.columns([2, 2, 2, 1, 1, 0.5, 0.5, 0.5])
         headers = ["Employee", "Project", "Task", "Planned Hours", "Status", "View", "Edit", "Del"]
         for c, h in zip(cols, headers): c.write(f"**{h}**")
