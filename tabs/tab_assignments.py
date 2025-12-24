@@ -13,7 +13,6 @@ def assignment_wizard_dialog(user_id, is_admin):
     st.subheader("Add New Assignment")
     
     # Step 1: Project (Context for the assignment)
-    # Passed is_admin to fetch ALL projects if admin
     projects = mq.fetch_approver_projects(user_id, is_admin)
     if not projects:
         st.error("No projects found.")
@@ -22,9 +21,22 @@ def assignment_wizard_dialog(user_id, is_admin):
     proj_opts = {p['project_id']: p['project_name'] for p in projects}
     sel_proj = st.selectbox("1. Select Project", options=proj_opts.keys(), format_func=lambda x: proj_opts[x])
 
-    # Step 2: Task Type
-    task_types = mq.fetch_task_types()
-    type_opts = {t['TaskTypeId']: t['TaskTypeName'] for t in task_types}
+    # --- UPDATED: Implicit Department Filtering ---
+    # Automatically get the Project's Department
+    project_dep_id = mq.get_project_details_simple(sel_proj)
+    
+    # Step 2: Task Type (Auto-filtered by Project's Department)
+    # This returns types specific to the Dept OR Global types
+    task_types = mq.fetch_task_types(dep_id_filter=project_dep_id)
+    
+    if not task_types:
+        st.error("No Task Types available for this Project's Department.")
+        return
+
+    type_opts = {
+        t['TaskTypeId']: t['TaskTypeName'] 
+        for t in task_types
+    }
     sel_type = st.selectbox("2. Select Task Type", options=type_opts.keys(), format_func=lambda x: type_opts[x])
     
     # Step 3: Global Task (Filtered by Type ONLY)
@@ -43,19 +55,28 @@ def assignment_wizard_dialog(user_id, is_admin):
     st.markdown("---")
     st.write("**4. Assignment Details**")
     
-    all_emps = mq.get_all_employees()
+    # --- UPDATED: Employees Auto-filtered by Project's Department ---
+    all_emps = mq.get_all_employees(dep_id=project_dep_id)
+    
+    if not all_emps:
+        st.warning("No employees found in this Project's Department.")
+        # We allow continuation if the user wants to see if there are global employees (if dep_id was None)
+        # But if dep_id is set and list is empty, dropdown will be empty.
+        if project_dep_id: 
+            st.stop()
+    
     emp_opts = {e['EmpId']: f"{e['EmpName']} ({e['SAP_ID']})" for e in all_emps}
     sel_emp = st.selectbox("Employee", options=emp_opts.keys(), format_func=lambda x: emp_opts[x])
     
     c1, c2 = st.columns(2)
-    assign_name = c1.text_input("Assignment Role/Name", value="Contributor")
-    hrs = c2.number_input("Planned Hours", min_value=0, step=1, value=0)
+    hrs = c1.number_input("Planned Hours", min_value=0, step=1, value=0)
+    
+    start_dt = c2.date_input("Start Date", value=date.today())
     
     c3, c4 = st.columns(2)
-    start_dt = c3.date_input("Start Date", value=date.today())
-    end_dt = c4.date_input("End Date", value=None)
+    end_dt = c3.date_input("End Date", value=None)
     
-    notes = st.text_area("Notes")
+    notes = st.text_area("Notes (Private to Managers)")
     
     if st.button("✅ Create Assignment", type="primary"):
         data = {
@@ -63,7 +84,6 @@ def assignment_wizard_dialog(user_id, is_admin):
             "project_id": sel_proj,
             "task_id": sel_task,
             "EmpId": sel_emp,
-            "assignment_name": assign_name,
             "planned_hours": hrs,
             "notes": notes,
             "start_date": start_dt,
@@ -84,7 +104,6 @@ def edit_assignment_dialog(assign, user_id, is_admin):
     
     with st.form("edit_assign_form"):
         # 1. Project Selection
-        # Passed is_admin to fetch ALL projects if admin
         projects = mq.fetch_approver_projects(user_id, is_admin)
         if not projects:
             st.error("No projects found.")
@@ -96,15 +115,24 @@ def edit_assignment_dialog(assign, user_id, is_admin):
         idx_proj = list(proj_opts.keys()).index(curr_proj) if curr_proj in proj_opts else 0
         sel_proj = st.selectbox("1. Project", options=proj_opts.keys(), format_func=lambda x: proj_opts[x], index=idx_proj)
 
-        # 2. Task Type Selection
-        task_types = mq.fetch_task_types()
-        type_opts = {t['TaskTypeId']: t['TaskTypeName'] for t in task_types}
+        # 2. Task Type Selection (Auto-filtered by Project Dept)
+        project_dep_id = mq.get_project_details_simple(sel_proj)
+        task_types = mq.fetch_task_types(dep_id_filter=project_dep_id)
+        
+        type_opts = {
+            t['TaskTypeId']: t['TaskTypeName'] 
+            for t in task_types
+        }
         
         curr_type = assign.get('TaskTypeId')
-        idx_type = list(type_opts.keys()).index(curr_type) if curr_type in type_opts else 0
+        if curr_type in type_opts:
+            idx_type = list(type_opts.keys()).index(curr_type)
+        else:
+            idx_type = 0
+            
         sel_type = st.selectbox("2. Task Type", options=type_opts.keys(), format_func=lambda x: type_opts[x], index=idx_type)
         
-        # 3. Task Selection (Global filtered by Type ONLY)
+        # 3. Task Selection
         tasks = mq.fetch_tasks_by_type(sel_type)
         
         if not tasks:
@@ -121,14 +149,19 @@ def edit_assignment_dialog(assign, user_id, is_admin):
         st.markdown("---")
         
         # 4. Details
-        all_emps = mq.get_all_employees()
+        # Auto-filter Employees by Project Dept
+        all_emps = mq.get_all_employees(dep_id=project_dep_id)
+        
+        if not all_emps:
+            st.warning("No employees found in the project's department.")
+            st.form_submit_button("Cannot Save (No Employees)")
+            return
+
         emp_opts = {e['EmpId']: f"{e['EmpName']} ({e['SAP_ID']})" for e in all_emps}
         
         curr_emp = assign.get('EmpId')
         idx_emp = list(emp_opts.keys()).index(curr_emp) if curr_emp in emp_opts else 0
         sel_emp = st.selectbox("Employee", options=emp_opts.keys(), format_func=lambda x: emp_opts[x], index=idx_emp)
-        
-        name = st.text_input("Assignment Name", value=assign.get('assignment_name', ''))
         
         c1, c2 = st.columns(2)
         hrs = c1.number_input("Planned Hours", min_value=0, step=1, value=int(assign.get('planned_hours') or 0))
@@ -138,7 +171,7 @@ def edit_assignment_dialog(assign, user_id, is_admin):
         start_dt = c3.date_input("Start Date", value=assign.get('start_date') or date.today())
         end_dt = c4.date_input("End Date", value=assign.get('end_date') or None)
         
-        notes = st.text_area("Notes", value=assign.get('notes') or "")
+        notes = st.text_area("Notes (Private to Managers)", value=assign.get('notes') or "")
         
         if st.form_submit_button("💾 Save Changes"):
             data = {
@@ -146,7 +179,6 @@ def edit_assignment_dialog(assign, user_id, is_admin):
                 "project_id": sel_proj,
                 "task_id": sel_task, 
                 "EmpId": sel_emp,
-                "assignment_name": name,
                 "planned_hours": hrs,
                 "notes": notes,
                 "start_date": start_dt,
@@ -189,7 +221,6 @@ def view_assignment_dialog(assign):
     | **Task** | {assign['task_name']} |
     | **Type** | {assign['TaskTypeName']} |
     | **Employee** | {assign['EmpName']} (SAP: {assign['SAP_ID']}) |
-    | **Role** | {assign['assignment_name'] or '-'} |
     | **Status** | {assign['status']} |
     | **Hours** | {int(assign['planned_hours'] or 0)} |
     | **Dates** | {assign['start_date']} to {assign['end_date'] or 'Ongoing'} |

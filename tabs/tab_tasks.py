@@ -11,20 +11,26 @@ def task_form_dialog(task_id, user_id):
     st.subheader(f"{'Edit' if is_edit else 'Add'} Global Task")
     
     with st.form("task_form"):
-        # Note: Projects are no longer selected here because Tasks are Global.
-        
         name = st.text_input("Task Name", value=task.get('task_name', ''))
         
-        task_types = mq.fetch_task_types()
+        # Fetch ALL task types (Manager creating a global task might want to see all options)
+        # Or pass None to see everything
+        task_types = mq.fetch_task_types(dep_id_filter=None)
+        
         if not task_types:
-            st.error("No Task Types found. Please add them in the 'Task Types' tab.")
+            st.error("No Task Types found.")
             st.stop()
 
-        type_opts = {t['TaskTypeId']: t['TaskTypeName'] for t in task_types}
+        # Update Display to include Department Name
+        type_opts = {
+            t['TaskTypeId']: f"{t['TaskTypeName']} - {t['DepName'] or 'Global'}" 
+            for t in task_types
+        }
         curr_type = task.get('TaskTypeId')
         idx_type = list(type_opts.keys()).index(curr_type) if curr_type in type_opts else 0
         sel_type = st.selectbox("Task Type", options=type_opts.keys(), format_func=lambda x: type_opts[x], index=idx_type)
-        
+
+
         if st.form_submit_button("💾 Save Task Definition"):
             if not name:
                 st.error("Task Name is required.")

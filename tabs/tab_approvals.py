@@ -1,15 +1,23 @@
 # ./tabs/tab_approvals.py
 import streamlit as st
 import pandas as pd
+from datetime import date, timedelta
 from utils import manager_queries as mq
 from utils.state_helpers import clear_other_dialogs, reset_dialog_state
+from lib.constants import ROLE_ID_ADMIN, ROLE_ID_DEPT_MANAGER, ROLE_ID_PROJECT_MANAGER
+
+# ========================================================
+# 🎨 Dialogs
+# ========================================================
 
 @st.dialog("Reject Timesheet")
 def reject_timesheet_dialog(entry, approver_id):
     st.warning(f"Rejecting timesheet for {entry['employee_name']}")
     with st.form("rejection_form"):
         comment = st.text_area("Reason (Required)")
-        if st.form_submit_button("Confirm Rejection", type="primary"):
+        
+        c1, c2 = st.columns(2)
+        if c1.form_submit_button("Confirm Rejection", type="primary"):
             if not comment:
                 st.error("Reason required.")
             else:
@@ -18,6 +26,11 @@ def reject_timesheet_dialog(entry, approver_id):
                 if "reject_entry_info" in st.session_state:
                     del st.session_state["reject_entry_info"]
                 st.rerun()
+        
+        if c2.form_submit_button("Cancel"):
+             if "reject_entry_info" in st.session_state:
+                del st.session_state["reject_entry_info"]
+             st.rerun()
 
 @st.dialog("✏️ Edit Entry (Admin)")
 def edit_entry_dialog(entry_summary, admin_user_id):
@@ -35,14 +48,12 @@ def edit_entry_dialog(entry_summary, admin_user_id):
         # 1. Project & Task Selection
         col_pt1, col_pt2 = st.columns(2)
         
-        # Project - Admins see ALL active projects
         all_projects = mq.fetch_all_active_projects()
         proj_opts = {p['project_id']: p['project_name'] for p in all_projects}
         curr_proj = full_entry.get('project_id')
         idx_proj = list(proj_opts.keys()).index(curr_proj) if curr_proj in proj_opts else 0
         sel_proj = col_pt1.selectbox("Project", options=proj_opts.keys(), format_func=lambda x: proj_opts[x], index=idx_proj)
         
-        # Task Type & Task
         task_types = mq.fetch_task_types()
         type_opts = {t['TaskTypeId']: t['TaskTypeName'] for t in task_types}
         
@@ -65,7 +76,6 @@ def edit_entry_dialog(entry_summary, admin_user_id):
         st.markdown("---")
         st.write("**Hours**")
         
-        # 2. Hours Input
         cols_h = st.columns(7)
         days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday']
         new_hours = {}
@@ -85,7 +95,6 @@ def edit_entry_dialog(entry_summary, admin_user_id):
 
         st.markdown("---")
         
-        # 3. Status & Notes
         c_stat, c_note = st.columns([1, 2])
         status_opts = ["draft", "submitted", "approved", "rejected"]
         curr_status = full_entry.get("status", "submitted").lower()
@@ -117,40 +126,171 @@ def edit_entry_dialog(entry_summary, admin_user_id):
                     del st.session_state["edit_entry_info"]
                 st.rerun()
 
+@st.dialog("➕ Admin: Insert Entry")
+def admin_insert_entry_dialog(admin_user_id):
+    st.caption("Insert a time entry on behalf of an employee. It will be **Approved** automatically.")
+    
+    with st.form("admin_create_entry"):
+        # 1. Employee
+        all_emps = mq.get_all_employees()
+        emp_opts = {e['EmpId']: f"{e['EmpName']} ({e['SAP_ID']})" for e in all_emps}
+        sel_emp = st.selectbox("Select Employee", options=emp_opts.keys(), format_func=lambda x: emp_opts[x])
+        
+        # 2. Project
+        all_projs = mq.fetch_all_active_projects()
+        proj_opts = {p['project_id']: p['project_name'] for p in all_projs}
+        sel_proj = st.selectbox("Select Project", options=proj_opts.keys(), format_func=lambda x: proj_opts[x])
+        
+        # 3. Task
+        c_type, c_task = st.columns(2)
+        task_types = mq.fetch_task_types()
+        type_opts = {t['TaskTypeId']: t['TaskTypeName'] for t in task_types}
+        sel_type = c_type.selectbox("Task Type", options=type_opts.keys(), format_func=lambda x: type_opts[x])
+        
+        tasks = mq.fetch_tasks_by_type(sel_type)
+        if not tasks:
+            c_task.warning("No tasks.")
+            sel_task = None
+        else:
+            task_opts = {t['task_id']: t['task_name'] for t in tasks}
+            sel_task = c_task.selectbox("Task", options=task_opts.keys(), format_func=lambda x: task_opts[x])
+            
+        st.markdown("---")
+        
+        # 4. Date & Hours
+        # Week selection logic
+        c_date, _ = st.columns(2)
+        week_start_input = c_date.date_input("Week Start Date", value=date.today() - timedelta(days=date.today().weekday()))
+        
+        # Adjust to true week start if needed (assuming Mon or Sun based on existing logic)
+        # Here we trust the Admin picks the correct date, or we can force-snap it.
+        # Let's verify standard Monday start for consistency:
+        # standard_start = week_start_input - timedelta(days=week_start_input.weekday())
+        # Using input directly to allow flexibility if business logic varies.
+        
+        st.write("**Daily Hours**")
+        cols = st.columns(7)
+        days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday']
+        hours = {}
+        for i, d in enumerate(days):
+            hours[d] = cols[i].number_input(d[:3].capitalize(), min_value=0, max_value=24, step=1, value=0)
+            
+        notes = st.text_area("Notes", "Entry inserted by Admin")
+        
+        if st.form_submit_button("✅ Save & Approve"):
+            if not sel_task:
+                st.error("Please select a task.")
+            elif sum(hours.values()) == 0:
+                st.warning("Total hours is 0.")
+            else:
+                data = {
+                    "target_user_id": sel_emp,
+                    "project_id": sel_proj,
+                    "task_id": sel_task,
+                    "week_start_date": week_start_input,
+                    "notes": notes,
+                    **hours
+                }
+                try:
+                    mq.create_admin_timesheet_entry(data, admin_user_id)
+                    st.success("Entry Created and Approved!")
+                    if "show_admin_entry_dialog" in st.session_state:
+                        del st.session_state["show_admin_entry_dialog"]
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+# ========================================================
+# Main Render
+# ========================================================
+
 def render(user, is_admin=False):
-    st.subheader("Pending & Submitted Timesheets")
-    # Updated: Passed is_admin to fetch ALL entries if admin
-    entries = mq.fetch_submitted_weekly_entries(user['user_id'], is_admin)
+    c1, c2 = st.columns([3, 1])
+    c1.subheader("Pending & Submitted Timesheets")
+    
+    # Refresh / Admin Action Buttons
+    with c2:
+        rc1, rc2 = st.columns([1, 1])
+        if rc1.button("🔄 Refresh"):
+            reset_dialog_state()
+            st.rerun()
+        
+        # --- NEW BUTTON FOR ADMIN ---
+        if is_admin:
+            if rc2.button("➕ Insert Entry"):
+                clear_other_dialogs("show_admin_entry_dialog")
+                st.session_state.show_admin_entry_dialog = True
+                st.rerun()
+
+    # Handle Admin Dialog Trigger
+    if st.session_state.get("show_admin_entry_dialog"):
+        admin_insert_entry_dialog(user['user_id'])
+
+    # Determine Role ID robustly
+    role_id = user.get('role_id')
+    if role_id is None:
+        if user.get('role') == 'admin': 
+            role_id = ROLE_ID_ADMIN
+        elif user.get('role') == 'dept_manager': 
+            role_id = ROLE_ID_DEPT_MANAGER
+        else: 
+            role_id = ROLE_ID_PROJECT_MANAGER
+
+    # Fetch entries (SQL should filter, but we will double check)
+    entries = mq.fetch_submitted_weekly_entries(user['user_id'], role_id)
+    
+    # --- Strict Logic: Fetch Allowed Projects for this User ---
+    allowed_projects = mq.fetch_approver_projects(user['user_id'], is_admin)
+    allowed_project_names = [p['project_name'] for p in allowed_projects]
     
     if not entries:
         st.info("No pending timesheets.")
     else:
         df = pd.DataFrame(entries)
-        col1, col2 = st.columns(2)
+        
+        # STRICT FILTER: Ensure we only show allowed projects
+        if not is_admin:
+            df = df[df['project_name'].isin(allowed_project_names)]
+            
+        if df.empty:
+            st.info("No pending timesheets for your assigned projects.")
+            return
+
+        # --- Filters Section (FIXED LAYOUT) ---
+        fc1, fc2, fc3 = st.columns(3)
         
         unique_emps = sorted(df["employee_name"].unique().tolist())
         
-        # FIX: Added on_change=reset_dialog_state to ensure modals don't pop up when filtering
-        emp_filter = col1.selectbox(
+        emp_filter = fc1.selectbox(
             "Employee", 
             ["All"] + unique_emps, 
             key="approvals_emp_filter", 
             on_change=reset_dialog_state
         )
         
-        status_filter = col2.selectbox(
+        unique_visible_projects = sorted(df["project_name"].unique().tolist())
+        proj_filter = fc2.selectbox(
+            "Project", 
+            ["All"] + unique_visible_projects, 
+            key="approvals_proj_filter",
+            on_change=reset_dialog_state
+        )
+        
+        status_filter = fc3.selectbox(
             "Status", 
             ["All", "draft", "submitted", "approved", "rejected"], 
             key="approvals_status_filter",
             on_change=reset_dialog_state
         )
         
+        # Apply UI Filters
         filtered = df.copy()
         if emp_filter != "All": filtered = filtered[filtered["employee_name"] == emp_filter]
+        if proj_filter != "All": filtered = filtered[filtered["project_name"] == proj_filter]
         if status_filter != "All": filtered = filtered[filtered["status"] == status_filter]
 
         if filtered.empty:
-            st.warning("No matches.")
+            st.warning("No matches found.")
         else:
             if is_admin:
                 cols = st.columns([3, 3, 2, 2, 1.5, 1.5, 1])
@@ -190,3 +330,5 @@ def render(user, is_admin=False):
                         clear_other_dialogs("edit_entry_info")
                         st.session_state.edit_entry_info = row
                         st.rerun()
+
+                        
